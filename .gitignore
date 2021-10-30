@@ -1,0 +1,5 @@
+*.out
+*.ipynb
+__pycache__/
+results/
+nohup000-003/
