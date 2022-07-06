@@ -935,7 +935,7 @@ class Args:
     batch_size = 60
     lr_step_size = 300
     lr_gamma = 0.1
-    device = "cuda:1"
+    device = "cuda:2"
     data_dir = "/home/jinhyo/JHS_server1/multi_class_motor_imagery/data/HGD"
     use_preprocessed_data = True
     preprocessed_data_path = None
@@ -944,7 +944,7 @@ class Args:
     end_to_end_weight = 0.9 # for end-to-end cross entropy loss
     tentative_weight = 0.1 # for tentative cross entropy loss
     assert 1 == (end_to_end_weight+tentative_weight)
-    
+
     def __init__(self, subject, i_try_start, result_dir):
         self.subject = subject
         self.i_try_start = i_try_start
@@ -968,18 +968,6 @@ class Args:
     
 # # In[ ]:
 if __name__ == "__main__":
-    # import time
-    # wait_for_file = "/home/jinhyo/JHS_server1/multi_class_motor_imagery/local_region_pruning/exp473/try10_subject9_higher_wider_overlap_4band_cnn_alpha_L1norm_1_lossWeight_09_01.h5"
-    # result_dir = __file__.split("/")[-1].split(".")[0]
-    # while not os.path.exists(wait_for_file):
-    #     print("\n\n\n\n")
-    #     print("*" * 60)
-    #     print("I am {}".format(result_dir))
-    #     print("Not yet created:\n{}".format(wait_for_file))
-    #     print("*" * 60)
-    #     print("\n\n\n\n")
-    #     time.sleep(60)
-        
     for i_try_start in range(1, 11):
         for subject in range(1,15):
             result_dir = __file__.split("/")[-1].split(".")[0]
