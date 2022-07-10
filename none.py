@@ -205,8 +205,10 @@ def sort_44ch_from_cnt(data, verbose=False):
         "C5", "C3", "C1", "C2", "C4", "C6",
         "CCP5h", "CCP3h", "CCP1h", "CCP2h", "CCP4h", "CCP6h",
         "CP5", "CP3", "CP1", "CPz", "CP2", "CP4", "CP6",
-        "CCP5h", "CCP3h", "CPP1h", "CCP2h", "CCP4h", "CCP6h"
+        "CPP5h", "CPP3h", "CPP1h", "CPP2h", "CPP4h", "CPP6h"
     ]
+    assert set(sorted_ch_names) == set(data["ch_names"])
+    assert len(sorted_ch_names) == 44
     sorted_ch_index = [data["ch_names"].index(ch_name) for ch_name in sorted_ch_names]
     data = deepcopy(data)
     data["ch_names"] = list(np.array(data["ch_names"])[sorted_ch_index])
@@ -838,7 +840,7 @@ def exp(rank, world_size, args):
                 overall_loss = loss_function(outputs, labels)
 
                 if args.use_amalgamated_loss is True:
-                    loss = overall_loss + sum(tentative_losses.values())
+                    loss = (args.end_to_end_weight*overall_loss) + (args.tentative_weight*sum(tentative_losses.values()))
                 elif args.use_amalgamated_loss is False:
                     loss = overall_loss
 
@@ -970,16 +972,19 @@ class Args:
     # setting
     use_amalgamated_loss = True
     epoch = 500
-    batch_size = 30 # 60
+    batch_size = 30 # 60; since 2 GPUs are used.
     lr_step_size = 300
     lr_gamma = 0.1
     # device = "cuda:2"
-    CUDA_VISIBLE_DEVICES = "2, 3"
+    CUDA_VISIBLE_DEVICES = "0, 1, 2"
     data_dir = "/home/jinhyo/JHS_server1/multi_class_motor_imagery/data/HGD"
     use_preprocessed_data = True
     preprocessed_data_path = None
     repeat = 1
-    save_name = "HGD_higher_wider_overlap_4band_highpass_dependent3_kernel_cnn_local_region_alpha_maxnorm_L1_1"
+    save_name = "HGD_higher_wider_overlap_4band_highpass_dependent3_kernel_cnn_local_region_alpha_maxnorm_L1_1_lossWeight_09_01"
+    end_to_end_weight = 0.9 # for end-to-end cross entropy loss
+    tentative_weight = 0.1 # for tentative cross entropy loss
+    assert 1 == (end_to_end_weight+tentative_weight)
     
     def __init__(self, subject, i_try_start, result_dir):
         self.subject = subject
@@ -987,7 +992,7 @@ class Args:
         self.result_dir = result_dir
         self.preprocessed_data_path = "/home/jinhyo/JHS_server1/multi_class_motor_imagery/local_region_pruning/"
         # self.preprocessed_data_path += "cache/{}/{}_data_subject{}.h5".format(result_dir, result_dir, subject)  
-        self.preprocessed_data_path += "cache/HGD_higher_wider_overlap_4band_highpass_lr/f0-4_f2-10_f6-22_f16-high_subject{}.h5".format(subject)  
+        self.preprocessed_data_path += "cache/HGD_higher_wider_overlap_4band_highpass_lr_fix/f0-4_f2-10_f6-22_f16-high_subject{}.h5".format(subject)  
         self.result_name = f"{result_dir}/try{i_try_start}_subject{subject}_{self.save_name}"
 
     def __repr__(self):
@@ -1007,6 +1012,18 @@ if __name__ == "__main__":
     os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"  # Arrange GPU devices starting from 0
     os.environ["CUDA_VISIBLE_DEVICES"]= Args.CUDA_VISIBLE_DEVICES  # Set the GPUs 2 and 3 to use
     world_size = torch.cuda.device_count()
+    import time
+    wait_for_file = "/home/jinhyo/JHS_server1/multi_class_motor_imagery/local_region_pruning/exp467/try10_subject9_higher_wider_overlap_4band_dependent3_kernel_cnn_alpha_L1norm_1_lossWeight_09_01_local_region.h5"
+    result_dir = __file__.split("/")[-1].split(".")[0]
+    while not os.path.exists(wait_for_file):
+        print("\n\n\n\n")
+        print("*" * 60)
+        print("I am {}".format(result_dir))
+        print("Not yet created:\n{}".format(wait_for_file))
+        print("*" * 60)
+        print("\n\n\n\n")
+        time.sleep(60)
+    
     for i_try_start in range(1, 11):
         for subject in range(1,15):
             result_dir = __file__.split("/")[-1].split(".")[0]
