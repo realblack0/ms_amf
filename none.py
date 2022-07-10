@@ -26,6 +26,9 @@ from bcitools.bcitools import (
 from braindecode.datasets.bbci import BBCIDataset
 from copy import deepcopy
 import resampy
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import datetime
 
 if __name__ == "__main__":
     log = logging.getLogger(__name__)
@@ -202,10 +205,8 @@ def sort_44ch_from_cnt(data, verbose=False):
         "C5", "C3", "C1", "C2", "C4", "C6",
         "CCP5h", "CCP3h", "CCP1h", "CCP2h", "CCP4h", "CCP6h",
         "CP5", "CP3", "CP1", "CPz", "CP2", "CP4", "CP6",
-        "CPP5h", "CPP3h", "CPP1h", "CPP2h", "CPP4h", "CPP6h"
+        "CCP5h", "CCP3h", "CPP1h", "CCP2h", "CCP4h", "CCP6h"
     ]
-    assert set(sorted_ch_names) == set(data["ch_names"])
-    assert len(sorted_ch_names) == 44
     sorted_ch_index = [data["ch_names"].index(ch_name) for ch_name in sorted_ch_names]
     data = deepcopy(data)
     data["ch_names"] = list(np.array(data["ch_names"])[sorted_ch_index])
@@ -214,7 +215,7 @@ def sort_44ch_from_cnt(data, verbose=False):
         print("- sorted_ch_names:", data["ch_names"])
         print("- shape of cnt:", data["cnt"].shape)
     return data
-
+    
 @verbose_func_name
 def resample_from_cnt(data, fs, verbose=False):
     """
@@ -537,7 +538,7 @@ class SelectLocalRegionHGD(nn.Module):
 #         return nn.LazyLinear.forward(self, x)
     
 
-def generate_subcnn_exp372(input_band_name, 
+def generate_subcnn_exp453(input_band_name, 
                             local_region_id,
                             kernel_size, 
                             padding=0,
@@ -585,11 +586,32 @@ def generate_subcnn_exp372(input_band_name,
 
         # init.xavier_uniform_(model.clf_conv.weight, gain=1)
         # init.constant_(model.clf_conv.bias, 0)
-    
+
+    # To initialize lazy layer
+    dummy_input = torch.zeros(size=(1,1,1125,n_local_region_channels))
+    model[3:](dummy_input)
+
     if verbose is True:
         print(model)
         
     return model
+
+class ParallelSubCNNs(nn.Module):
+    def __init__(self, SubCNN, sub_cnn_dicts):
+        super().__init__()
+        sub_cnns = []
+        for sub_cnn_name, sub_cnn_dict in sub_cnn_dicts.items():
+            sub_cnns.append(
+                (sub_cnn_name, SubCNN(**sub_cnn_dict))
+            )
+        self.sub_cnns = nn.ModuleDict(OrderedDict(sub_cnns))
+
+    def forward(self, X):
+        sub_outputs = OrderedDict()
+        for sub_cnn_name, sub_cnn in self.sub_cnns.items():
+            sub_output = sub_cnn(X)
+            sub_outputs[sub_cnn_name] = sub_output
+        return sub_outputs
 
     
 class WeightCombiner_for_dict(nn.Module):
@@ -611,27 +633,16 @@ class WeightCombiner_for_dict(nn.Module):
         return weighted.sum(dim=1)
         
 
-class MultiCNN(nn.Module):
-    def __init__(self, SubCNN, sub_cnn_dicts):
+class MultiCNN_exp453(nn.Module):
+    def __init__(self, parallel_sub_cnns, weight_combiner):
         super().__init__()
-        sub_cnns = []
-        for sub_cnn_name, sub_cnn_dict in sub_cnn_dicts.items():
-            sub_cnns.append(
-                (sub_cnn_name, SubCNN(**sub_cnn_dict))
-            )
-        self.sub_cnns = nn.ModuleDict(OrderedDict(sub_cnns))
-        self.weight_combiner = WeightCombiner_for_dict(S=len(self.sub_cnns))
+        self.parallel_sub_cnns = parallel_sub_cnns
+        self.weight_combiner = weight_combiner
         
     def forward(self, Xs):
-        sub_outputs = self.tentative_forward(Xs)
+        sub_outputs = self.parallel_sub_cnns(Xs)
         return self.weight_combiner(**sub_outputs)
     
-    def tentative_forward(self, X):
-        sub_outputs = OrderedDict()
-        for sub_cnn_name, sub_cnn in self.sub_cnns.items():
-            sub_output = sub_cnn(X)
-            sub_outputs[sub_cnn_name] = sub_output
-        return sub_outputs
     
 
 # In[8]:
@@ -684,12 +695,12 @@ def evaluate_trialwise_with_dataloader_without_ind(model, trial_dataloaders, mod
         }
         
 
-def maxnorm(model):
+def maxnorm_453(model):
     last_weight = None
     assert model.__class__ == nn.Sequential
     for name, module in list(model.named_modules()):
         if hasattr(module, "weight") and (
-            not module.__class__.__name__.startswith("BatchNorm")
+            "BatchNorm" not in module.__class__.__name__
         ):
             module.weight.data = torch.renorm(module.weight.data, 2, 0, maxnorm=2)
             last_weight = module.weight
@@ -697,9 +708,9 @@ def maxnorm(model):
         last_weight.data = torch.renorm(last_weight.data, 2, 0, maxnorm=0.5)
 
 
-def multi_maxnorm(multi_model):
-    for name, model in list(multi_model.sub_cnns.items()):
-        maxnorm(model)
+def multi_maxnorm_exp453(multi_model):
+    for name, model in list(multi_model.parallel_sub_cnns.module.sub_cnns.items()):
+        maxnorm_453(model)
         
         
 # In[ ]:
@@ -709,20 +720,23 @@ import os
 from torch.utils.data import DataLoader
 import pandas as pd
 
-def exp(args):
+def exp(rank, world_size, args):
     assert os.path.exists(args.result_dir)
 
     print("args:\n", args)
     subject = args.subject
-    device = args.device
 
+    # DistributedDataParallel setup
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
     # 1. Data load  & 2. Preprocessing
     if (os.path.exists(args.preprocessed_data_path)
         ) and (args.use_preprocessed_data is True):
         # load preprocessed data
         data_path = args.preprocessed_data_path
-        data = torch.load(data_path, map_location=args.device)
+        data = torch.load(data_path, map_location=torch.device(rank))
         Xs_tr = data["Xs_tr"]
         ys_tr = data["ys_tr"]
         Xs_te = data["Xs_te"]
@@ -734,9 +748,9 @@ def exp(args):
     
         # 3. to Tensor
         print("\nTrain")
-        Xs_tr, ys_tr = to_tensor(Xs_tr, ys_tr, device=args.device)
+        Xs_tr, ys_tr = to_tensor(Xs_tr, ys_tr, device=rank)
         print("\nTest")
-        Xs_te, ys_te = to_tensor(Xs_te, ys_te, device=args.device)
+        Xs_te, ys_te = to_tensor(Xs_te, ys_te, device=rank)
     
         if not os.path.exists(args.preprocessed_data_path):
             data = OrderedDict()
@@ -765,9 +779,12 @@ def exp(args):
         )
 
     # 5. DataLoader
+    train_sampler = torch.utils.data.distributed.DistributedSampler(multi_dict_dataset_tr)
     multi_dict_dataloaders = {
-        "tr": DataLoader(multi_dict_dataset_tr, batch_size=args.batch_size, shuffle=True),
-        "te": DataLoader(multi_dict_dataset_te, batch_size=args.batch_size, shuffle=False),
+        "tr": DataLoader(multi_dict_dataset_tr, batch_size=args.batch_size, 
+                         shuffle=(train_sampler is None), sampler=train_sampler),
+        "te": DataLoader(multi_dict_dataset_te, batch_size=args.batch_size, 
+                         shuffle=False),
     } # for evaluation
 
 
@@ -778,15 +795,22 @@ def exp(args):
         
         
         # 6. Model
-        model = MultiCNN(SubCNN=generate_subcnn_exp372, 
-                                sub_cnn_dicts=args.sub_cnn_dicts)
-        model = model.to(device)
-        # # To initialize Lazy layer.
-        # for dummy_input, dummy_label, _ in first_training_dataloader:
-        #     print("shape of input", dummy_input.shape)
-        #     dummy_output = model(dummy_input)
-        #     print("shape of output", dummy_output.shape)
-        #     break
+        # parallel sub cnns
+        _parallel_sub_cnns = ParallelSubCNNs(
+            SubCNN=generate_subcnn_exp453, 
+            sub_cnn_dicts=args.sub_cnn_dicts
+        )
+        _parallel_sub_cnns = _parallel_sub_cnns.to(rank)
+        _parallel_sub_cnns = nn.SyncBatchNorm.convert_sync_batchnorm(_parallel_sub_cnns).to(rank) # convert_sync_batchnorm
+        _parallel_sub_cnns = nn.parallel.DistributedDataParallel(_parallel_sub_cnns, device_ids=[rank])
+        # weight combiner
+        _weight_combiner = WeightCombiner_for_dict(
+            S=len(_parallel_sub_cnns.module.sub_cnns)
+        )
+        _weight_combiner = _weight_combiner.to(rank)
+        _weight_combiner = nn.parallel.DistributedDataParallel(_weight_combiner, device_ids=[rank])
+        # multi cnn model
+        model = MultiCNN_exp453(_parallel_sub_cnns, _weight_combiner)
         
 
         # 7. Learning strategy
@@ -798,10 +822,12 @@ def exp(args):
         print("\nTraining")
         epoch_df = pd.DataFrame()            
         for epoch in range(1, args.epoch+1):
+            train_sampler.set_epoch(epoch)
+            
             # Train
             model.train()
             for inputs, labels in multi_dict_dataloaders["tr"]:  
-                sub_outputs = model.tentative_forward(inputs) # dictionary
+                sub_outputs = model.parallel_sub_cnns(inputs) # dictionary
                 outputs = model.weight_combiner(**sub_outputs) # tensor
                 
                 tentative_losses = OrderedDict()
@@ -812,7 +838,7 @@ def exp(args):
                 overall_loss = loss_function(outputs, labels)
 
                 if args.use_amalgamated_loss is True:
-                    loss = (args.end_to_end_weight*overall_loss) + (args.tentative_weight*sum(tentative_losses.values()))
+                    loss = overall_loss + sum(tentative_losses.values())
                 elif args.use_amalgamated_loss is False:
                     loss = overall_loss
 
@@ -820,73 +846,84 @@ def exp(args):
                 loss.backward()
                 optimizer.step()
                 
-                multi_maxnorm(model)
+                multi_maxnorm_exp453(model)
                 maxnorm_weight = lambda x: x/torch.norm(x, p=1) if torch.norm(x, p=1) > 1 else x
-                model.weight_combiner.weight_coeff.data = maxnorm_weight(model.weight_combiner.weight_coeff.data)
-
-
-            # Evaluation
-            evaluation_tr = evaluate_trialwise_with_dataloader_without_ind(
-                model,
-                trial_dataloaders=multi_dict_dataloaders,
-                mode="tr",
-                prefix="",
-            )
-            evaluation_te = evaluate_trialwise_with_dataloader_without_ind(
-                model,
-                trial_dataloaders=multi_dict_dataloaders,
-                mode="te",
-                prefix="",
-            )
-            # evaluation subs
-            evaluation_subs = {}
-            for sub_cnn_name, sub_cnn in model.sub_cnns.items():
-                evaluation_sub_i_tr = evaluate_trialwise_with_dataloader_without_ind(
-                    sub_cnn,
-                    trial_dataloaders=multi_dict_dataloaders,
-                    mode="tr",
-                    prefix="{}_".format(sub_cnn_name),
-                )
-                evaluation_sub_i_te = evaluate_trialwise_with_dataloader_without_ind(
-                    sub_cnn,
-                    trial_dataloaders=multi_dict_dataloaders,
-                    mode="te",
-                    prefix="{}_".format(sub_cnn_name),
-                )
-                evaluation_subs.update(evaluation_sub_i_tr)
-                evaluation_subs.update(evaluation_sub_i_te)
-                
-            # update epoch_df
-            assert len(epoch_df) == epoch-1
-            epoch_df = epoch_df.append(
-                dict(
-                    **evaluation_subs, 
-                    **evaluation_tr, 
-                    **evaluation_te,
-                ),
-                ignore_index=True,
-            )
-            print(args.result_dir, args.save_name)
-            print("try", i_try, "subject", subject, "epoch", epoch)
-            print(epoch_df.iloc[-1])
-            print()
+                model.weight_combiner.module.weight_coeff.data = maxnorm_weight(model.weight_combiner.module.weight_coeff.data)
             
             # step scheduler for every epoch
             lr_scheduler.step()
             
+            # Evaluation
+            if rank == 0: 
+                # It is not DDP model, just local model.
+                # To avoid dist.barrier hanging.
+                model_module = MultiCNN_exp453(
+                    parallel_sub_cnns=model.parallel_sub_cnns.module, 
+                    weight_combiner=model.weight_combiner.module
+                )
+                evaluation_tr = evaluate_trialwise_with_dataloader_without_ind(
+                    model_module,
+                    trial_dataloaders=multi_dict_dataloaders,
+                    mode="tr",
+                    prefix="",
+                )
+                evaluation_te = evaluate_trialwise_with_dataloader_without_ind(
+                    model_module,
+                    trial_dataloaders=multi_dict_dataloaders,
+                    mode="te",
+                    prefix="",
+                )
+                # evaluation subs
+                evaluation_subs = {}
+                for sub_cnn_name, sub_cnn in model_module.parallel_sub_cnns.sub_cnns.items():
+                    evaluation_sub_i_tr = evaluate_trialwise_with_dataloader_without_ind(
+                        sub_cnn,
+                        trial_dataloaders=multi_dict_dataloaders,
+                        mode="tr",
+                        prefix="{}_".format(sub_cnn_name),
+                    )
+                    evaluation_sub_i_te = evaluate_trialwise_with_dataloader_without_ind(
+                        sub_cnn,
+                        trial_dataloaders=multi_dict_dataloaders,
+                        mode="te",
+                        prefix="{}_".format(sub_cnn_name),
+                    )
+                    evaluation_subs.update(evaluation_sub_i_tr)
+                    evaluation_subs.update(evaluation_sub_i_te)
+                # update epoch_df
+                assert len(epoch_df) == epoch-1
+                epoch_df = epoch_df.append(
+                    dict(
+                        **evaluation_subs, 
+                        **evaluation_tr, 
+                        **evaluation_te,
+                    ),
+                    ignore_index=True,
+                )
+                print(datetime.datetime.now())
+                print(args.result_dir, args.save_name)
+                print("try", i_try, "subject", subject, "epoch", epoch)
+                print(epoch_df.iloc[-1])
+                print()
+            
+            dist.barrier()
+            
         # After training
-        print("\nLast Epoch")
-        print(epoch_df.iloc[-1])
+        if rank == 0:
+            print("\nLast Epoch")
+            print(epoch_df.iloc[-1])
 
-        # result_name = f"{args.result_dir}/try{i_try}_subject{subject}_{args.save_name}"
-        result_name = args.result_name.format(i_try)
-        epoch_df.to_csv(result_name + ".csv")
-        torch.save(model.state_dict(), result_name + ".h5")
+            # result_name = f"{args.result_dir}/try{i_try}_subject{subject}_{args.save_name}"
+            result_name = args.result_name.format(i_try)
+            epoch_df.to_csv(result_name + ".csv")
+            # torch.save(model.state_dict(), result_name + ".h5")
+            torch.save(model_module.state_dict(), result_name + ".h5")
 
-        # 
-        results.append(round(epoch_df["te_acc"].iloc[-1], 2))
+            # no more needed..
+            results.append(round(epoch_df["te_acc"].iloc[-1], 2))
 
-    return results
+    # return results
+    return 
 
 class Args:
     # multi band
@@ -906,7 +943,8 @@ class Args:
     assert kernel_dicts.keys() == input_band_dicts.keys()
     # sub-CNN configuration
     sub_cnn_dicts = OrderedDict()
-    for _local_region_id in ["all"]:
+    # for _local_region_id in ["all"]:
+    for _local_region_id in range(1,45): # 44 channels
         for _input_band_name in input_band_dicts.keys():
             _sub_cnn_name = "sub_cnn_LR{}_{}".format(_local_region_id, _input_band_name)
             sub_cnn_dicts[_sub_cnn_name] = OrderedDict(
@@ -932,26 +970,24 @@ class Args:
     # setting
     use_amalgamated_loss = True
     epoch = 500
-    batch_size = 60
+    batch_size = 30 # 60
     lr_step_size = 300
     lr_gamma = 0.1
-    device = "cuda:2"
+    # device = "cuda:2"
+    CUDA_VISIBLE_DEVICES = "2, 3"
     data_dir = "/home/jinhyo/JHS_server1/multi_class_motor_imagery/data/HGD"
     use_preprocessed_data = True
     preprocessed_data_path = None
     repeat = 1
-    save_name = "HGD_higher_wider_overlap_4band_highpass_dependent3_kernel_cnn_alpha_maxnorm_L1_1_lossWeight_09_01"
-    end_to_end_weight = 0.9 # for end-to-end cross entropy loss
-    tentative_weight = 0.1 # for tentative cross entropy loss
-    assert 1 == (end_to_end_weight+tentative_weight)
-
+    save_name = "HGD_higher_wider_overlap_4band_highpass_dependent3_kernel_cnn_local_region_alpha_maxnorm_L1_1"
+    
     def __init__(self, subject, i_try_start, result_dir):
         self.subject = subject
         self.i_try_start = i_try_start
         self.result_dir = result_dir
         self.preprocessed_data_path = "/home/jinhyo/JHS_server1/multi_class_motor_imagery/local_region_pruning/"
         # self.preprocessed_data_path += "cache/{}/{}_data_subject{}.h5".format(result_dir, result_dir, subject)  
-        self.preprocessed_data_path += "cache/HGD_higher_wider_overlap_4band_highpass_lr_fix/f0-4_f2-10_f6-22_f16-high_subject{}.h5".format(subject)  
+        self.preprocessed_data_path += "cache/HGD_higher_wider_overlap_4band_highpass_lr/f0-4_f2-10_f6-22_f16-high_subject{}.h5".format(subject)  
         self.result_name = f"{result_dir}/try{i_try_start}_subject{subject}_{self.save_name}"
 
     def __repr__(self):
@@ -968,6 +1004,9 @@ class Args:
     
 # # In[ ]:
 if __name__ == "__main__":
+    os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"  # Arrange GPU devices starting from 0
+    os.environ["CUDA_VISIBLE_DEVICES"]= Args.CUDA_VISIBLE_DEVICES  # Set the GPUs 2 and 3 to use
+    world_size = torch.cuda.device_count()
     for i_try_start in range(1, 11):
         for subject in range(1,15):
             result_dir = __file__.split("/")[-1].split(".")[0]
@@ -980,5 +1019,7 @@ if __name__ == "__main__":
                 print("*" * 60)
                 print("\n\n\n\n")
                 continue
-            exp(args) 
+            mp.spawn(exp,
+                     args=(world_size, args),
+                     nprocs=world_size) 
                 
