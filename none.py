@@ -972,7 +972,7 @@ class Args:
     # setting
     use_amalgamated_loss = True
     epoch = 500
-    batch_size = 30 # 60; since 2 GPUs are used.
+    batch_size = 20 # 60; since 3 GPUs are used.
     lr_step_size = 300
     lr_gamma = 0.1
     # device = "cuda:2"
