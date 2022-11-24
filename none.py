@@ -4,13 +4,14 @@
 # In[1]:
 # data.py
 
+from ast import Or
 from unittest import result
 import numpy as np
 import torch
 from collections import OrderedDict
 import logging
 import sys
-sys.path += ["/home/jinhyo/JHS_server1/multi_class_motor_imagery"]
+sys.path += ["/home/jinhyo/JHS_server2/multi_class_motor_imagery"]
 from bcitools.bcitools import (load_gdf2mat_feat_mne,
                                s_to_cnt,
                                rerange_label_from_0,
@@ -445,37 +446,44 @@ def exp(args):
 
 
     # 1. Data load  & 2. Preprocessing
-    if (os.path.exists(args.preprocessed_data_path)
-        ) and (args.use_preprocessed_data is True):
-        # load preprocessed data
-        data_path = args.preprocessed_data_path
-        data = torch.load(data_path, map_location=args.device)
-        Xs_tr = data["Xs_tr"]
-        ys_tr = data["ys_tr"]
-        Xs_te = data["Xs_te"]
-        ys_te = data["ys_te"]
-    elif (not os.path.exists(args.preprocessed_data_path)
-        ) or (args.use_preprocessed_data is False):
-        Xs_tr, ys_tr = load_and_preprocessing_for_input_band_dicts_exp346(args=args, train=True)
-        Xs_te, ys_te = load_and_preprocessing_for_input_band_dicts_exp346(args=args, train=False)
+    total_Xs_tr = OrderedDict()
+    total_ys_tr = OrderedDict()
+    total_Xs_te = OrderedDict()
+    total_ys_te = OrderedDict()
+    for s in range(1,10):
+        # load subject data
+        if args.use_preprocessed_data is True:
+            # load preprocessed data
+            data_path = args.preprocessed_data_path_format.format(s)
+            data = torch.load(data_path, map_location=args.device)
+            total_Xs_tr[s] = data["Xs_tr"]
+            total_ys_tr[s] = data["ys_tr"]
+            total_Xs_te[s] = data["Xs_te"]
+            total_ys_te[s] = data["ys_te"]
+        else :
+            raise
     
-        # 3. to Tensor
-        print("\nTrain")
-        Xs_tr, ys_tr = to_tensor(Xs_tr, ys_tr, device=args.device)
-        print("\nTest")
-        Xs_te, ys_te = to_tensor(Xs_te, ys_te, device=args.device)
-    
-        if not os.path.exists(args.preprocessed_data_path):
-            data = OrderedDict()
-            data["Xs_tr"] = Xs_tr
-            data["ys_tr"] = ys_tr
-            data["Xs_te"] = Xs_te
-            data["ys_te"] = ys_te
-            torch.save(data, args.preprocessed_data_path)
-    else :
-        raise
-    
-    
+    # target subject
+    _ = total_Xs_tr.pop(subject)
+    assert len(total_Xs_tr) == 8
+    _ = total_ys_tr.pop(subject)
+    assert len(total_ys_tr) == 8
+    Xs_te = total_Xs_te.pop(subject)
+    ys_te = total_ys_te.pop(subject)
+    # nontarget subjects
+    Xs_tr = OrderedDict()
+    ys_tr = OrderedDict()
+    for key in Xs_te.keys():
+        temp_X = []
+        temp_y = []
+        for s in total_Xs_tr.keys():
+            temp_X.append(total_Xs_tr[s][key])
+            temp_X.append(total_Xs_te[s][key])
+            temp_y.append(total_ys_tr[s][key])
+            temp_y.append(total_ys_te[s][key])
+        Xs_tr[key] = torch.cat(temp_X)
+        ys_tr[key] = torch.cat(temp_y)
+            
     # 4. Dataset 
     print("\nDataset")
     print("\ntrain")
@@ -661,12 +669,12 @@ class Args:
     batch_size = 60
     lr_step_size = 300
     lr_gamma = 0.1
-    device = "cuda:2"
-    data_dir = "/home/jinhyo/JHS_server1/multi_class_motor_imagery/data/BCICIV_2a/gdf"
+    device = "cuda:1"
+    data_dir = "/home/jinhyo/JHS_server2/multi_class_motor_imagery/data/BCICIV_2a/gdf"
     use_preprocessed_data = True
     preprocessed_data_path = None
     repeat = 1
-    save_name = "higher_wider_overlap_4band_dependent3_kernel_cnn_alpha_L1norm_1_lossWeight_09_01"
+    save_name = "subject_independent_mbkcnn"
     end_to_end_weight = 0.9 # for end-to-end cross entropy loss
     tentative_weight = 0.1 # for tentative cross entropy loss
     assert 1 == (end_to_end_weight+tentative_weight)
@@ -675,8 +683,8 @@ class Args:
         self.subject = subject
         self.i_try_start = i_try_start
         self.result_dir = result_dir
-        self.preprocessed_data_path = "/home/jinhyo/JHS_server1/multi_class_motor_imagery/local_region_pruning/"
-        self.preprocessed_data_path += "cache/higher_wider_overlap_4band/f0-4_f2-10_f6-22_f16-38_subject{}.h5".format(subject)  
+        self.preprocessed_data_path_format = "/home/jinhyo/JHS_server2/multi_class_motor_imagery/local_region_pruning/"
+        self.preprocessed_data_path_format += "cache/higher_wider_overlap_4band/f0-4_f2-10_f6-22_f16-38_subject{}.h5"  
         self.result_name = f"{result_dir}/try{i_try_start}_subject{subject}_{self.save_name}"
         
     def __repr__(self):
@@ -693,9 +701,10 @@ class Args:
     
 # # In[ ]:
 if __name__ == "__main__":
-    for i_try_start in range(1, 11):
+    for i_try_start in range(1, 2):
         for subject in range(1,10):
-            result_dir = __file__.split("/")[-1].split(".")[0]
+            result_dir = "/home/jinhyo/JHS_server2/multi_class_motor_imagery/SI_mbk-cnn/"
+            result_dir += __file__.split("/")[-1].split(".")[0]
             args = Args(subject=subject, i_try_start=i_try_start, result_dir=result_dir)
             assert args.repeat == 1
             if (os.path.exists(args.result_name+".csv")) and (os.path.exists(args.result_name+".h5")):
