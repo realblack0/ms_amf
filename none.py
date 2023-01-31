@@ -1144,8 +1144,7 @@ if __name__ == '__main__':
 
 
     subject = args.subject
-    # data_dir = "/home/jinhyo/multi_class_motor_imagery/data/BCICIV_2a/gdf"
-    data_dir = "/home/jinhyo/JHS_server2/multi_class_motor_imagery/data/BCICIV_2a/gdf"
+    data_dir = "/home/jinhyo/multi_class_motor_imagery/data/BCICIV_2a/gdf"
 
     lowcut = args.lowcut
     highcut = 38 
